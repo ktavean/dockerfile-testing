@@ -59,7 +59,7 @@ jobs:
           sudo chmod +x /usr/local/bin/hadolint
 
       - name: Install Trivy (latest)
-        uses: aquasecurity/setup-trivy@v0.2.0
+        uses: aquasecurity/setup-trivy@v0.2.6
 
       - name: Cache Trivy DB (refreshes every 6h on its own)
         uses: actions/cache@v4
