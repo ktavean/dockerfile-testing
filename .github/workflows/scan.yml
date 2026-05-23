@@ -1,0 +1,211 @@
+# licenta-cicd — container hardening workflow
+#
+# Drop this file at .github/workflows/scan.yml in your repo. Pin
+# licenta-cicd to a specific version (recommended) by changing the
+# `pip install` line to e.g. `licenta-cicd==0.1.0` once it's on PyPI,
+# or pin the git ref while it's still source-only.
+#
+# Flow:
+#   1. install tools (licenta-cicd, hadolint, trivy, dive)
+#   2. pre-build scanners (hadolint, entropy, cis) — run on source
+#   3. build the image, capturing the log so a failure can be reported
+#   4. record-build → emits BUILD-FAILED finding on exit != 0
+#   5. post-build scanners (trivy, dive) — skipped on build failure
+#   6. aggregate report → summary + annotations + PR comments
+#   7. always: remediate → patches a copy of the Dockerfile
+#   8. always: peter-evans/create-pull-request → opens a PR if patched
+#   9. policy gate → fails the workflow on POLICY_REJECTED (last step)
+#
+# Steps 7–8 use `if: always()` so the developer gets a remediation PR
+# even when the scan rejects the build.
+
+name: Container Hardening Scan
+
+on:
+  push:
+    paths:
+      - 'Dockerfile'
+      - 'Dockerfile.*'
+      - 'docker-compose*.yml'
+      - '.github/workflows/scan.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'Dockerfile.*'
+      - 'docker-compose*.yml'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write           # bot PR creation needs write
+      pull-requests: write      # PR review comments + opening remediation PR
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install docker-testing-suite
+        run: pip install git+https://github.com/ktavean/docker-testing-suite.git
+
+      - name: Install hadolint
+        run: |
+          sudo wget -qO /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          sudo chmod +x /usr/local/bin/hadolint
+
+      - name: Install Trivy (latest)
+        uses: aquasecurity/setup-trivy@v0.2.0
+
+      - name: Cache Trivy DB (refreshes every 6h on its own)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}
+
+      - name: Install dive
+        run: |
+          DIVE_VERSION=0.12.0
+          sudo wget -qO /tmp/dive.deb \
+            "https://github.com/wagoodman/dive/releases/download/v${DIVE_VERSION}/dive_${DIVE_VERSION}_linux_amd64.deb"
+          sudo dpkg -i /tmp/dive.deb
+
+      - name: Prepare findings dir
+        run: mkdir -p findings
+
+      # ── Pre-build scanners (source only) ─────────────────────────────
+
+      - name: Hadolint scan
+        run: licenta-cicd scan hadolint Dockerfile --out findings/hadolint.json
+        continue-on-error: true
+
+      - name: Entropy scan
+        run: licenta-cicd scan entropy Dockerfile --out findings/entropy.json
+        continue-on-error: true
+
+      - name: CIS scan
+        run: licenta-cicd scan cis Dockerfile --out findings/cis.json
+        continue-on-error: true
+
+      # ── Build (captured separately so build failure becomes a finding) ─
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        id: build
+        continue-on-error: true
+        run: |
+          set +e
+          docker buildx build \
+            --load \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            -t scan:${{ github.sha }} \
+            -f Dockerfile . 2>&1 | tee /tmp/build.log
+          EXIT=${PIPESTATUS[0]}
+          echo "exit-code=$EXIT" >> "$GITHUB_OUTPUT"
+          # Don't fail this step — record-build will emit the finding,
+          # and the policy gate at the end will reject if needed.
+          exit 0
+
+      - name: Record build status
+        run: |
+          licenta-cicd record-build \
+            --exit-code ${{ steps.build.outputs.exit-code }} \
+            --log /tmp/build.log \
+            --out findings/build.json
+
+      # ── Post-build scanners (need the built image) ───────────────────
+
+      - name: Trivy scan
+        if: steps.build.outputs.exit-code == '0'
+        run: |
+          licenta-cicd scan trivy \
+            --image scan:${{ github.sha }} \
+            --dockerfile Dockerfile \
+            --out findings/trivy.json
+        continue-on-error: true
+
+      - name: Dive scan
+        if: steps.build.outputs.exit-code == '0'
+        run: |
+          licenta-cicd scan dive \
+            --image scan:${{ github.sha }} \
+            --out findings/dive.json
+        continue-on-error: true
+
+      # ── Aggregate report ────────────────────────────────────────────
+
+      - name: Aggregate report
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+        run: |
+          licenta-cicd report \
+            --in findings/ \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --annotations \
+            --pr-comments \
+            --dockerfile Dockerfile \
+            --image "scan:${{ github.sha }}"
+
+      - name: Upload findings artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhh-findings
+          path: findings/
+          retention-days: 90
+
+      # ── Remediation → bot PR ────────────────────────────────────────
+      # Runs even on REJECTED scans so the developer always gets a
+      # proposed fix alongside the failure.
+
+      - name: Generate remediation
+        if: always()
+        run: |
+          cp Dockerfile /tmp/Dockerfile.original
+          licenta-cicd remediate /tmp/Dockerfile.original \
+            --out Dockerfile \
+            --apply-tiers HIGH \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Open remediation PR (HIGH-confidence fixes only)
+        if: always()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: licenta-cicd/auto-remediation
+          base: ${{ github.head_ref || github.ref_name }}
+          title: '[licenta-cicd] Proposed Dockerfile hardening'
+          commit-message: 'chore: apply licenta-cicd HIGH-confidence remediations'
+          delete-branch: true
+          add-paths: Dockerfile
+          body: |
+            This PR was auto-generated by **licenta-cicd**.
+
+            It contains only **HIGH-confidence** remediations from the
+            most recent scan. Review carefully before merging — even
+            HIGH-confidence fixes can be wrong for your specific case.
+
+            **To suppress a finding instead of applying its fix**, add
+            an inline marker above the relevant line:
+            ```
+            # dhh:ignore=<RULE> reason="<why>"
+            ```
+            (Applies to CIS and ENTROPY findings only; other tools have
+            their own ignore mechanisms.)
+
+            See the workflow run for the full report, including
+            MEDIUM/LOW-confidence suggestions that were *not* applied.
+
+      # ── Policy gate (LAST — can fail the workflow) ──────────────────
+
+      - name: Policy gate
+        if: always()
+        run: licenta-cicd policy --in findings/ --fail-on POLICY_REJECTED

@@ -1,0 +1,58 @@
+# ============================================================
+# ITERATION 1 / 6  —  BASELINE  (expected verdict: POLICY_REJECTED)
+# ============================================================
+# The starting point. Every category trips: secrets, critical
+# misconfiguration, base-image CVEs, package CVEs, best practices.
+# Nothing here is fixed yet — this is the worst-case scan.
+# ============================================================
+
+# Ancient base, no tag pin, no digest
+FROM ubuntu
+
+# Running as root is fine right? right???
+USER root
+
+# Update + install in separate layers (cache poisoning), unpinned versions,
+# unnecessary tools (wget, vim, ssh, telnet), curl-pipe-bash, no GPG verify
+RUN apt-get update
+RUN apt-get install -y --allow-unauthenticated \
+    curl \
+    wget \
+    vim \
+    openssh-server \
+    telnet \
+    netcat \
+    git \
+    sudo \
+    build-essential
+
+# Pipe random script straight into bash
+RUN curl -fsSL https://get.docker.com | bash
+
+# Download a binary, don't verify it
+RUN wget https://example.com/totally-safe.tar.gz && tar xzf totally-safe.tar.gz
+
+# Hardcoded secrets everywhere
+ENV AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+ENV AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+ENV GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890
+ENV GOOGLE_API_KEY=AIzaSyB-1234567890abcdefghijklmnopqrstuvw
+ENV DB_PASSWORD=hunter2
+ENV STRIPE_KEY=sk_live_4eC39HqLyjWDarjtT1zdp7dc
+ENV CONFIG_BLOB=H4xK7mZ9PqR3T8vNb2cF6jL5wY1aD0sE
+
+# ADD instead of COPY (silently downloads from URL!)
+ADD https://example.com/config.json /app/config.json
+
+# Use ADD for a tarball (auto-extracts, can be malicious)
+ADD app.tar.gz /app/
+
+# Sudo for no reason
+RUN echo "myuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# No HEALTHCHECK, no USER directive switching back, no setuid cleanup
+# Run as root forever
+WORKDIR /app
+EXPOSE 22
+EXPOSE 80
+CMD ["bash"]
